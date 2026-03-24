@@ -332,4 +332,447 @@ app.post('/webhook', async (req, res) => {
       });
 
       const { data: allRatings } = await supabase
-        .from('ratings').select('rating').eq('rated
+        .from('ratings').select('rating').eq('rated_phone', ratedPhone);
+      const avgRating = allRatings.reduce((s, r) => s + r.rating, 0) / allRatings.length;
+
+      if (isTransporter) {
+        await supabase.from('drivers')
+          .update({ rating: avgRating }).eq('phone', ratedPhone);
+      }
+
+      await sendWhatsApp(from,
+        `⭐ *Rating दे दी!*\n\n` +
+        `${'⭐'.repeat(rating)} ${rating}/5\n` +
+        `Comment: "${comment}"\n\n` +
+        `धन्यवाद! 🙏`
+      );
+
+      await sendWhatsApp(ratedPhone,
+        `⭐ *नई Rating मिली!*\n\n` +
+        `${'⭐'.repeat(rating)} ${rating}/5\n` +
+        `"${comment}"\n\n` +
+        `नई Average Rating: ${generateStars(avgRating)}`
+      );
+      return res.sendStatus(200);
+    }
+
+    // ─── INSURANCE CLAIM ───
+    if (message.toUpperCase().startsWith('CLAIM ')) {
+      const parts = message.split(' ');
+      const certificateNo = parts[1]?.trim();
+      const description = parts.slice(2).join(' ') || 'कोई description नहीं';
+
+      const { data: policy } = await supabase
+        .from('insurance_policies').select('*')
+        .eq('certificate_no', certificateNo).single();
+
+      if (!policy || (from !== policy.transporter_phone && from !== policy.driver_phone)) {
+        await sendWhatsApp(from, '❌ Certificate नहीं मिला या आप इस policy में नहीं हैं।');
+        return res.sendStatus(200);
+      }
+
+      const claimNo = `CLM-${Date.now()}`;
+      await supabase.from('insurance_claims').insert({
+        claim_no: claimNo,
+        certificate_no: certificateNo,
+        load_id: policy.load_id,
+        claimed_by: from,
+        description,
+        status: 'submitted',
+        coverage_amount: policy.coverage_amount
+      });
+
+      await sendWhatsApp(from,
+        `🛡️ *Claim Submit हो गया!*\n\n` +
+        `Claim No: ${claimNo}\n` +
+        `24 घंटे में हमारी team contact करेगी।\n\n` +
+        `ये documents तैयार रखें:\n` +
+        `📸 नुकसान की photos\n` +
+        `📄 Police report (अगर accident)\n` +
+        `📋 माल की receipt`
+      );
+
+      await sendWhatsApp(ADMIN_PHONE,
+        `🚨 *Insurance Claim आया!*\n\n` +
+        `Claim: ${claimNo}\n` +
+        `Certificate: ${certificateNo}\n` +
+        `By: ${from}\n` +
+        `Description: ${description}`
+      );
+      return res.sendStatus(200);
+    }
+
+    // =====================================
+    // CONVERSATION FLOW WITH SESSIONS
+    // =====================================
+
+    let session = sessions[from] || {};
+
+    // ─── DRIVER FLOW ───
+    const { data: driverCheck } = await supabase
+      .from('drivers').select('*').eq('phone', from).single();
+
+    if (driverCheck) {
+      // Driver is viewing a load and responding 1 or 2
+      if (session.state === 'viewing_load') {
+        if (msg === '1') {
+          const loadId = session.currentLoadId;
+          const { data: load } = await supabase
+            .from('loads').select('*').eq('id', loadId).single();
+
+          if (!load || load.status !== 'open') {
+            await sendWhatsApp(from, '❌ माफ करें, यह load अब available नहीं है।');
+            sessions[from] = {};
+            return res.sendStatus(200);
+          }
+
+          await supabase.from('acceptances').insert({
+            load_id: loadId,
+            driver_phone: from,
+            driver_name: driverCheck.name,
+            payment_status: 'pending'
+          });
+
+          await supabase.from('loads')
+            .update({ status: 'pending_payment', assigned_driver_phone: from })
+            .eq('id', loadId);
+
+          await sendWhatsApp(from,
+            `✅ *काम Accept हो गया!*\n\n` +
+            `📍 ${load.from_city} → ${load.to_city}\n` +
+            `💰 आपकी कमाई: ₹${load.price}\n\n` +
+            `⏳ Transporter के payment का इंतज़ार है।\n` +
+            `Payment होते ही Transporter की details मिलेगी।`
+          );
+
+          const insuranceDetails = calculateInsurance(load.price);
+          const totalPayable = COMMISSION + insuranceDetails.totalPremium;
+          const upiLink = generateUPILink(totalPayable, loadId);
+
+          await sendWhatsApp(load.transporter_phone,
+            `✅ *Driver मिल गया!*\n\n` +
+            `📍 ${load.from_city} → ${load.to_city}\n` +
+            `🚛 Driver: ${driverCheck.name}\n` +
+            `⭐ Rating: ${generateStars(driverCheck.rating)}\n\n` +
+            `💳 *Payment करें:*\n` +
+            `├ Commission: ₹${COMMISSION}\n` +
+            `├ Insurance: ₹${insuranceDetails.totalPremium}\n` +
+            `└ *Total: ₹${totalPayable}*\n\n` +
+            `📱 UPI ID: *${UPI_ID}*\n` +
+            `👤 नाम: ${UPI_NAME}\n\n` +
+            `🔗 UPI Link: ${upiLink}\n\n` +
+            `Payment के बाद भेजें:\n` +
+            `*PAID ${loadId} [Transaction ID]*`
+          );
+
+          sessions[from] = {};
+          return res.sendStatus(200);
+
+        } else if (msg === '2') {
+          sessions[from] = {};
+          await sendWhatsApp(from,
+            `ठीक है! 👍\n\n` +
+            `जब नया load आएगा, आपको फिर notification मिलेगी।`
+          );
+          return res.sendStatus(200);
+        }
+      }
+
+      // Driver main menu
+      await sendWhatsApp(from,
+        `🚛 *नमस्ते ${driverCheck.name} भाई!*\n\n` +
+        `आप क्या करना चाहते हैं?\n\n` +
+        `1️⃣ उपलब्ध Loads देखें\n` +
+        `2️⃣ मेरा चालू काम\n` +
+        `3️⃣ मेरी Rating देखें\n\n` +
+        `सिर्फ 1, 2 या 3 भेजें 👆`
+      );
+
+      if (msg === '1') {
+        const { data: loads } = await supabase
+          .from('loads').select('*').eq('status', 'open')
+          .order('created_at', { ascending: false }).limit(3);
+
+        if (!loads || loads.length === 0) {
+          await sendWhatsApp(from,
+            `😔 अभी कोई load available नहीं है।\n\n` +
+            `जैसे ही नया load आएगा, आपको notification मिलेगी!`
+          );
+        } else {
+          for (const load of loads) {
+            sessions[from] = { role: 'driver', state: 'viewing_load', currentLoadId: load.id };
+            await sendWhatsApp(from,
+              `🚛 *Load Available है!*\n\n` +
+              `📍 से: *${load.from_city}*\n` +
+              `🏁 तक: *${load.to_city}*\n` +
+              `⚖️ वजन: *${load.weight}*\n` +
+              `💰 कीमत: *₹${load.price}*\n` +
+              `📅 कब: *${load.available_date}*\n\n` +
+              `1️⃣ हाँ, यह काम चाहिए ✅\n` +
+              `2️⃣ नहीं ❌`
+            );
+          }
+        }
+      } else if (msg === '2') {
+        const { data: currentJob } = await supabase
+          .from('loads').select('*')
+          .eq('assigned_driver_phone', from)
+          .in('status', ['assigned', 'delivered'])
+          .order('created_at', { ascending: false })
+          .limit(1).single();
+
+        if (!currentJob) {
+          await sendWhatsApp(from, `😔 अभी कोई चालू काम नहीं है।`);
+        } else {
+          await sendWhatsApp(from,
+            `📦 *आपका चालू काम:*\n\n` +
+            `📍 ${currentJob.from_city} → ${currentJob.to_city}\n` +
+            `⚖️ ${currentJob.weight}\n` +
+            `💰 ₹${currentJob.price}\n` +
+            `📊 Status: ${currentJob.status}\n\n` +
+            `Delivery के बाद Transporter से confirm करवाएं।`
+          );
+        }
+      } else if (msg === '3') {
+        await sendWhatsApp(from,
+          `⭐ *आपकी Rating:*\n\n` +
+          `${generateStars(driverCheck.rating)}\n\n` +
+          `अच्छी rating के लिए:\n` +
+          `✅ समय पर पहुँचें\n` +
+          `✅ माल सुरक्षित पहुँचाएं\n` +
+          `✅ Transporter से अच्छे से बात करें`
+        );
+      }
+
+      return res.sendStatus(200);
+    }
+
+    // ─── TRANSPORTER FLOW ───
+    // Check if in middle of posting a load
+    if (session.state === 'asking_from') {
+      sessions[from] = { ...session, from_city: message, state: 'asking_to' };
+      await sendWhatsApp(from,
+        `👍 *${message}* से माल जाएगा।\n\n` +
+        `🏁 माल कहाँ पहुँचाना है?\n` +
+        `(शहर का नाम लिखें, जैसे: Delhi, Pune, Chennai)`
+      );
+      return res.sendStatus(200);
+    }
+
+    if (session.state === 'asking_to') {
+      sessions[from] = { ...session, to_city: message, state: 'asking_weight' };
+      await sendWhatsApp(from,
+        `👍 *${message}* तक पहुँचाना है।\n\n` +
+        `⚖️ कितना माल है?\n` +
+        `(जैसे: 5 ton, 10 ton, 500 kg)`
+      );
+      return res.sendStatus(200);
+    }
+
+    if (session.state === 'asking_weight') {
+      sessions[from] = { ...session, weight: message, state: 'asking_price' };
+      await sendWhatsApp(from,
+        `👍 *${message}* माल है।\n\n` +
+        `💰 कितने पैसे देंगे Driver को?\n` +
+        `(सिर्फ number लिखें, जैसे: 45000)`
+      );
+      return res.sendStatus(200);
+    }
+
+    if (session.state === 'asking_price') {
+      sessions[from] = { ...session, price: message, state: 'asking_date' };
+      await sendWhatsApp(from,
+        `👍 ₹*${message}* देंगे।\n\n` +
+        `📅 माल कब चाहिए?\n` +
+        `(जैसे: Aaj, Kal, 25 March, 1 April)`
+      );
+      return res.sendStatus(200);
+    }
+
+    if (session.state === 'asking_date') {
+      const loadData = {
+        from_city: session.from_city,
+        to_city: session.to_city,
+        weight: session.weight,
+        price: session.price,
+        available_date: message
+      };
+
+      sessions[from] = { ...session, available_date: message, state: 'confirming', loadData };
+
+      const insuranceDetails = calculateInsurance(session.price);
+      const totalPayable = COMMISSION + insuranceDetails.totalPremium;
+
+      await sendWhatsApp(from,
+        `📋 *आपका Load:*\n\n` +
+        `📍 कहाँ से: *${loadData.from_city}*\n` +
+        `🏁 कहाँ तक: *${loadData.to_city}*\n` +
+        `⚖️ वजन: *${loadData.weight}*\n` +
+        `💰 कीमत: *₹${loadData.price}*\n` +
+        `📅 तारीख: *${loadData.available_date}*\n\n` +
+        `🛡️ Insurance: ₹${insuranceDetails.totalPremium} (Coverage: ₹${insuranceDetails.coverage.toLocaleString()})\n` +
+        `💵 Commission: ₹${COMMISSION}\n` +
+        `📊 Driver मिलने पर Total: ₹${totalPayable}\n\n` +
+        `क्या यह सही है?\n\n` +
+        `1️⃣ हाँ, Post करो ✅\n` +
+        `2️⃣ नहीं, फिर से भरो ❌`
+      );
+      return res.sendStatus(200);
+    }
+
+    if (session.state === 'confirming') {
+      if (msg === '1') {
+        const { data: newLoad } = await supabase
+          .from('loads')
+          .insert({
+            transporter_phone: from,
+            ...session.loadData,
+            insurance_fee: calculateInsurance(session.loadData.price).totalPremium,
+            insurance_status: 'pending'
+          })
+          .select().single();
+
+        const driverCount = await notifyDrivers(newLoad);
+        sessions[from] = {};
+
+        await sendWhatsApp(from,
+          `✅ *Load Post हो गया!*\n\n` +
+          `📍 ${session.loadData.from_city} → ${session.loadData.to_city}\n` +
+          `👥 ${driverCount} Drivers को notification गई!\n\n` +
+          `जैसे ही Driver Accept करेगा, आपको message आएगा। 📱`
+        );
+
+      } else if (msg === '2') {
+        sessions[from] = { state: 'asking_from' };
+        await sendWhatsApp(from,
+          `ठीक है! फिर से भरते हैं।\n\n` +
+          `📍 माल कहाँ से जाएगा?\n` +
+          `(शहर का नाम लिखें, जैसे: Mumbai, Surat)`
+        );
+      }
+      return res.sendStatus(200);
+    }
+
+    // ─── MAIN MENU (New User or Transporter) ───
+    // Show role selection if unknown user
+    if (msg === 'hi' || msg === 'hello' || msg === 'helo' ||
+        msg === 'हाय' || msg === 'हेलो' || msg === 'नमस्ते' ||
+        msg === 'start' || msg === '0' || !session.role) {
+
+      sessions[from] = {};
+      await sendWhatsApp(from,
+        `🚛 *नमस्ते! Transport Bot में आपका स्वागत है!*\n\n` +
+        `आप कौन हैं?\n\n` +
+        `1️⃣ मैं Transporter हूँ\n` +
+        `   (माल भेजना है)\n\n` +
+        `2️⃣ मैं Driver हूँ\n` +
+        `   (काम चाहिए)\n\n` +
+        `सिर्फ 1 या 2 भेजें 👆`
+      );
+      return res.sendStatus(200);
+    }
+
+    if (msg === '1' && !session.state) {
+      sessions[from] = { role: 'transporter', state: 'asking_from' };
+      await sendWhatsApp(from,
+        `👍 *Transporter Menu*\n\n` +
+        `चलिए Load post करते हैं!\n\n` +
+        `📍 माल कहाँ से जाएगा?\n` +
+        `(शहर का नाम लिखें, जैसे: Mumbai, Surat, Pune)`
+      );
+      return res.sendStatus(200);
+    }
+
+    if (msg === '2' && !session.state) {
+      sessions[from] = { role: 'driver' };
+      await sendWhatsApp(from,
+        `🚛 *Driver Menu*\n\n` +
+        `आप registered नहीं हैं।\n\n` +
+        `Register होने के लिए Admin से contact करें:\n` +
+        `📞 ${ADMIN_PHONE}\n\n` +
+        `Register होने के बाद automatically loads मिलेंगे!`
+      );
+      return res.sendStatus(200);
+    }
+
+    // Default fallback
+    await sendWhatsApp(from,
+      `🚛 *Transport Bot*\n\n` +
+      `शुरू करने के लिए भेजें: *Hi*\n\n` +
+      `या कोई भी message भेजें।`
+    );
+
+  } catch (error) {
+    console.error('Error:', error);
+    await sendWhatsApp(from,
+      `😔 कुछ गलत हो गया। थोड़ी देर बाद try करें।\n` +
+      `या Admin से contact करें: ${ADMIN_PHONE}`
+    );
+  }
+
+  res.sendStatus(200);
+});
+
+// =====================================
+// API ENDPOINTS
+// =====================================
+
+app.post('/register-driver', async (req, res) => {
+  const { name, phone, from_city, to_city, truck_capacity } = req.body;
+  const { data, error } = await supabase.from('drivers')
+    .insert({ name, phone, from_city, to_city, truck_capacity })
+    .select().single();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ success: true, driver: data });
+});
+
+app.get('/loads', async (req, res) => {
+  const { data } = await supabase.from('loads')
+    .select('*').order('created_at', { ascending: false });
+  res.json(data);
+});
+
+app.get('/drivers', async (req, res) => {
+  const { data } = await supabase.from('drivers').select('*');
+  res.json(data);
+});
+
+app.get('/payments', async (req, res) => {
+  const { data } = await supabase.from('payments')
+    .select('*').order('created_at', { ascending: false });
+  res.json(data);
+});
+
+app.get('/', (req, res) => res.send('Transport Bot India is running! 🚛'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+```
+
+4. Click **"Commit changes"** → **"Commit changes"** again ✅
+
+---
+
+## 🎯 Complete Conversation Flow
+```
+Anyone sends Hi
+      ↓
+Bot asks: Transporter or Driver?
+      ↓
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+TRANSPORTER path:
+      ↓
+Bot asks city one by one in Hindi
+From → To → Weight → Price → Date
+      ↓
+Shows summary for confirmation
+      ↓
+Posts load & notifies all drivers
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+DRIVER path:
+      ↓
+Gets instant load notification
+      ↓
+Replies 1 = Accept, 2 = Reject
+      ↓
+Payment → Contacts shared
