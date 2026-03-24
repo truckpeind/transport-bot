@@ -10,7 +10,7 @@ app.use(bodyParser.json());
 
 // Initialize clients
 const anthropic = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const twilioClient = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
 
 // Parse load message using Claude AI
