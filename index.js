@@ -748,31 +748,3 @@ app.get('/', (req, res) => res.send('Transport Bot India is running! 🚛'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 ```
-
-4. Click **"Commit changes"** → **"Commit changes"** again ✅
-
----
-
-## 🎯 Complete Conversation Flow
-```
-Anyone sends Hi
-      ↓
-Bot asks: Transporter or Driver?
-      ↓
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-TRANSPORTER path:
-      ↓
-Bot asks city one by one in Hindi
-From → To → Weight → Price → Date
-      ↓
-Shows summary for confirmation
-      ↓
-Posts load & notifies all drivers
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-DRIVER path:
-      ↓
-Gets instant load notification
-      ↓
-Replies 1 = Accept, 2 = Reject
-      ↓
-Payment → Contacts shared
