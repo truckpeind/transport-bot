@@ -652,7 +652,110 @@ app.post('/webhook', async (req, res) => {
       }
       return res.sendStatus(200);
     }
+// ─── DRIVER REGISTRATION FLOW ───
+    if (session.state === 'reg_asking_name') {
+      sessions[from] = { ...session, driver_name: message, state: 'reg_asking_from' };
+      await sendWhatsApp(from,
+        `👍 नाम: *${message}*\n\n` +
+        `🏙️ आप किस शहर से चलते हैं?\n` +
+        `(जैसे: Mumbai, Surat, Pune, Delhi)`
+      );
+      return res.sendStatus(200);
+    }
 
+    if (session.state === 'reg_asking_from') {
+      sessions[from] = { ...session, driver_from: message, state: 'reg_asking_to' };
+      await sendWhatsApp(from,
+        `👍 From: *${message}*\n\n` +
+        `🏁 आप किस शहर तक जाते हैं?\n` +
+        `(जैसे: Delhi, Chennai, Kolkata)`
+      );
+      return res.sendStatus(200);
+    }
+
+    if (session.state === 'reg_asking_to') {
+      sessions[from] = { ...session, driver_to: message, state: 'reg_asking_capacity' };
+      await sendWhatsApp(from,
+        `👍 To: *${message}*\n\n` +
+        `🚛 आपके Truck की capacity क्या है?\n` +
+        `(जैसे: 5 ton, 10 ton, 20 ton)`
+      );
+      return res.sendStatus(200);
+    }
+
+    if (session.state === 'reg_asking_capacity') {
+      sessions[from] = { ...session, driver_capacity: message, state: 'reg_confirming' };
+      await sendWhatsApp(from,
+        `👍 Capacity: *${message}*\n\n` +
+        `📋 *आपकी Details:*\n\n` +
+        `👤 नाम: *${session.driver_name}*\n` +
+        `📍 From: *${session.driver_from}*\n` +
+        `🏁 To: *${session.driver_to}*\n` +
+        `🚛 Capacity: *${message}*\n\n` +
+        `क्या यह सही है?\n\n` +
+        `1️⃣ हाँ, Register करो ✅\n` +
+        `2️⃣ नहीं, फिर से भरो ❌`
+      );
+      return res.sendStatus(200);
+    }
+
+    if (session.state === 'reg_confirming') {
+      if (msg === '1') {
+        // Save driver to database
+        const { data: newDriver, error } = await supabase
+          .from('drivers')
+          .insert({
+            name: session.driver_name,
+            phone: from,
+            from_city: session.driver_from,
+            to_city: session.driver_to,
+            truck_capacity: session.driver_capacity,
+            is_available: true
+          })
+          .select().single();
+
+        if (error) {
+          await sendWhatsApp(from,
+            `❌ Registration में problem आई।\n\n` +
+            `Admin से contact करें: ${ADMIN_PHONE}`
+          );
+          sessions[from] = {};
+          return res.sendStatus(200);
+        }
+
+        sessions[from] = {};
+
+        // Notify driver
+        await sendWhatsApp(from,
+          `🎉 *Registration हो गई!*\n\n` +
+          `👤 नाम: ${newDriver.name}\n` +
+          `📍 Route: ${newDriver.from_city} → ${newDriver.to_city}\n` +
+          `🚛 Capacity: ${newDriver.truck_capacity}\n\n` +
+          `✅ अब आपको नए loads की notification मिलेगी!\n\n` +
+          `जब भी कोई load आएगा,\n` +
+          `आपको WhatsApp पर message आएगा। 📱\n\n` +
+          `Transport Bot में आपका स्वागत है! 🚛`
+        );
+
+        // Notify admin
+        await sendWhatsApp(ADMIN_PHONE,
+          `🆕 *नया Driver Register हुआ!*\n\n` +
+          `👤 नाम: ${newDriver.name}\n` +
+          `📞 Phone: ${from}\n` +
+          `📍 Route: ${newDriver.from_city} → ${newDriver.to_city}\n` +
+          `🚛 Capacity: ${newDriver.truck_capacity}\n\n` +
+          `Total Drivers: Check dashboard`
+        );
+
+      } else if (msg === '2') {
+        sessions[from] = { role: 'driver', state: 'reg_asking_name' };
+        await sendWhatsApp(from,
+          `ठीक है! फिर से भरते हैं।\n\n` +
+          `👤 आपका पूरा नाम क्या है?`
+        );
+      }
+      return res.sendStatus(200);
+    }
     // ─── MAIN MENU (New User or Transporter) ───
     // Show role selection if unknown user
     if (msg === 'hi' || msg === 'hello' || msg === 'helo' ||
@@ -683,15 +786,31 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
 
-    if (msg === '2' && !session.state) {
-      sessions[from] = { role: 'driver' };
-      await sendWhatsApp(from,
-        `🚛 *Driver Menu*\n\n` +
-        `आप registered नहीं हैं।\n\n` +
-        `Register होने के लिए Admin से contact करें:\n` +
-        `📞 ${ADMIN_PHONE}\n\n` +
-        `Register होने के बाद automatically loads मिलेंगे!`
-      );
+if (msg === '2' && !session.state) {
+      // Check if already registered
+      const { data: existingDriver } = await supabase
+        .from('drivers').select('*').eq('phone', from).single();
+
+      if (existingDriver) {
+        sessions[from] = { role: 'driver' };
+        await sendWhatsApp(from,
+          `✅ *नमस्ते ${existingDriver.name} भाई!*\n\n` +
+          `आप already registered हैं!\n\n` +
+          `आप क्या करना चाहते हैं?\n\n` +
+          `1️⃣ उपलब्ध Loads देखें\n` +
+          `2️⃣ मेरा चालू काम\n` +
+          `3️⃣ मेरी Rating देखें\n\n` +
+          `सिर्फ 1, 2 या 3 भेजें 👆`
+        );
+      } else {
+        sessions[from] = { role: 'driver', state: 'reg_asking_name' };
+        await sendWhatsApp(from,
+          `🚛 *Driver Registration*\n\n` +
+          `स्वागत है! चलिए आपको register करते हैं।\n\n` +
+          `👤 आपका पूरा नाम क्या है?\n` +
+          `(जैसे: Ravi Kumar, Suresh Singh)`
+        );
+      }
       return res.sendStatus(200);
     }
 
